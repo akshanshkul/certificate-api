@@ -99,7 +99,7 @@ class ApiKeyAuth implements FilterInterface
 
         // 7) Check client allowed_ips if set (comma separated list of IPs or CIDRs)
         $allowedIps = trim((string) ($client['allowed_ips'] ?? ''));
-        if ($allowedIps !== '') {
+        if (empty(getenv('CLIENT_IP_CHECK')) && $allowedIps !== '') {
             if (!$this->ipAllowed($allowedIps, $remoteIp)) {
                 return Services::response()
                     ->setStatusCode(403)

@@ -33,23 +33,8 @@
                                 <?php if ($certificate['last_generated_url']): ?>
                                     <a href="<?= esc($certificate['last_generated_url']) ?>"
                                         class="btn btn-sm btn-success mr-2" target="_blank">
-                                        <i class="fas fa-file-pdf"></i> Combined PDF
+                                        <i class="fas fa-file-pdf"></i> Download All (one PDF)
                                     </a>
-                                <?php endif; ?>
-
-                                <?php if ($zip_job): ?>
-                                    <?php if ($zip_job['status'] === 'completed'): ?>
-                                        <a href="<?= esc($zip_job['zip_url']) ?>" class="btn btn-sm btn-primary"
-                                            target="_blank">
-                                            <i class="fas fa-file-archive"></i> Download ZIP
-                                        </a>
-                                    <?php elseif ($zip_job['status'] === 'failed'): ?>
-                                        <span class="badge badge-danger">ZIP Failed</span>
-                                    <?php else: ?>
-                                        <span class="badge badge-info">ZIP Processing... (<?= $zip_job['status'] ?>)</span>
-                                    <?php endif; ?>
-                                <?php else: ?>
-                                    <span class="text-muted small">No ZIP job recorded for this batch</span>
                                 <?php endif; ?>
                             </div>
                         </div>

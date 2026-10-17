@@ -15,6 +15,8 @@ class CertificateModel extends Model
         'name',
         'description',
         'orientation',
+        'page_width_mm',
+        'page_height_mm',
         'template_path',
         'data_keys',
         'template_updated_at',

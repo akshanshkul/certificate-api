@@ -4,9 +4,62 @@ namespace App\Libraries;
 
 use TCPDF;
 
+/**
+ * Draws certificates onto their template with TCPDF.
+ *
+ * The template image comes from TemplateImageCache: a local, pre-scaled JPEG,
+ * fetched once per template rather than per certificate. TCPDF then reads it
+ * straight from disk, and in a combined PDF embeds it once for every page.
+ */
 class CertificatePDFService
 {
+    /** Positions are measured in CSS pixels, which is what a browser lays out in. */
+    private const POSITION_DPI = 96;
+
+    /** The one-dimensional barcodes TCPDF can draw. */
+    private const BARCODE_TYPES = [
+        'C39', 'C39+', 'C39E', 'C39E+', 'C93', 'S25', 'S25+',
+        'I25', 'I25+', 'C128', 'C128A', 'C128B', 'C128C',
+        'EAN2', 'EAN5', 'EAN8', 'EAN13', 'UPCA', 'UPCE',
+        'MSI', 'MSI+', 'POSTNET', 'PLANET', 'RMS4CC', 'KIX', 'IMB', 'CODABAR', 'CODE11',
+    ];
+
     private $pixelsToMm = 0.264583333; // Default 96 DPI factor
+
+    private TemplateImageCache $templates;
+
+    /** Prepared templates already looked up in this request. */
+    private array $prepared = [];
+
+    public function __construct(?TemplateImageCache $templates = null)
+    {
+        $this->templates = $templates ?? new TemplateImageCache();
+    }
+
+    /**
+     * The local copy of a certificate's template, or null when it has none or
+     * it cannot be read (the certificate is then drawn without a background
+     * rather than not at all).
+     */
+    private function template(array $certificate): ?array
+    {
+        $path = (string) ($certificate['template_path'] ?? '');
+
+        if ($path === '') {
+            return null;
+        }
+
+        if (!array_key_exists($path, $this->prepared)) {
+            try {
+                $this->prepared[$path] = $this->templates->get($path);
+            } catch (\Throwable $e) {
+                log_message('error', 'Certificate template unavailable: ' . $e->getMessage());
+                $this->prepared[$path] = null;
+            }
+        }
+
+        return $this->prepared[$path];
+    }
 
     /**
      * Generate a single PDF certificate
@@ -53,32 +106,31 @@ class CertificatePDFService
     {
         $orientation = $certificate['orientation'] ?? 'L';
 
-        // Robust page size detection based on image dimensions
-        $templatePath = $certificate['template_path'];
         $pageSize = 'A4'; // Fallback
+        $template = $this->template($certificate);
 
-        if ($templatePath) {
-            $fullPath = $templatePath;
-            if (!filter_var($templatePath, FILTER_VALIDATE_URL)) {
-                $fullPath = WRITEPATH . str_replace('writable/', '', $templatePath);
-            }
+        // Positions are measured against the artwork, so the scale from a
+        // position to a millimetre is set by the artwork either way.
+        if ($template !== null) {
+            $this->pixelsToMm = 25.4 / self::POSITION_DPI;
+            $pageSize = [$template['width'] * $this->pixelsToMm, $template['height'] * $this->pixelsToMm];
+        }
 
-            $imageInfo = @getimagesize($fullPath);
-            if ($imageInfo) {
-                $imgWidth = $imageInfo[0];
-                $imgHeight = $imageInfo[1];
+        // A size that was asked for wins over the one the artwork implies.
+        //
+        // An ID card has to come out at 85.6 by 54 millimetres to fit a badge
+        // holder, and artwork for one at any printable resolution would
+        // otherwise make a page the size of a poster. The positions still refer
+        // to the artwork, so they are rescaled to the page that is actually
+        // being printed rather than the one the pixels suggest.
+        $width  = (float) ($certificate['page_width_mm'] ?? 0);
+        $height = (float) ($certificate['page_height_mm'] ?? 0);
 
-                // Scale down if too large (matching Api\Certificate logic)
-                $maxPixels = 2000;
-                if ($imgWidth > $maxPixels || $imgHeight > $maxPixels) {
-                    $scale = $maxPixels / max($imgWidth, $imgHeight);
-                    $imgWidth = intval($imgWidth * $scale);
-                    $imgHeight = intval($imgHeight * $scale);
-                }
+        if ($width > 0 && $height > 0) {
+            $pageSize = [$width, $height];
 
-                $dpi = 96;
-                $this->pixelsToMm = 25.4 / $dpi;
-                $pageSize = array($imgWidth * $this->pixelsToMm, $imgHeight * $this->pixelsToMm);
+            if ($template !== null && $template['width'] > 0) {
+                $this->pixelsToMm = $width / $template['width'];
             }
         }
 
@@ -90,6 +142,11 @@ class CertificatePDFService
         $pdf->SetAutoPageBreak(false, 0);
         $pdf->SetMargins(0, 0, 0);
 
+        // No padding inside a cell. A field is placed at a point, not in a box,
+        // and TCPDF's default millimetre of padding pushed every line of text
+        // a millimetre right of where it was put.
+        $pdf->setCellPaddings(0, 0, 0, 0);
+
         $pdf->AddPage();
 
         return $pdf;
@@ -100,18 +157,14 @@ class CertificatePDFService
      */
     private function renderTemplate(&$pdf, $certificate, $templateVars, $data)
     {
-        $templatePath = $certificate['template_path'] ?? '';
         $pageWidth = $pdf->getPageWidth();
         $pageHeight = $pdf->getPageHeight();
 
-        // Add template image (MUST USE ABSOLUTE PATH)
-        if ($templatePath) {
-            $fullPath = $templatePath;
-            if (!filter_var($templatePath, FILTER_VALIDATE_URL)) {
-                $fullPath = WRITEPATH . str_replace('writable/', '', $templatePath);
-            }
-            // Use absolute path for TCPDF Image()
-            $pdf->Image($fullPath, 0, 0, $pageWidth, $pageHeight, '', '', '', false, 300, '', false, false, 0);
+        // A local JPEG: TCPDF embeds it as it is, and reuses it on every page.
+        $template = $this->template($certificate);
+
+        if ($template !== null) {
+            $pdf->Image($template['path'], 0, 0, $pageWidth, $pageHeight, $template['type'], '', '', false, 300, '', false, false, 0);
         }
 
         $fontMap = [
@@ -143,6 +196,13 @@ class CertificatePDFService
             $x = (float) ($var['x'] ?? 0) * $this->pixelsToMm;
             $y = (float) ($var['y'] ?? 0) * $this->pixelsToMm;
 
+            // A field can be printed as a code rather than as its characters.
+            // An ID card usually carries at least one — a QR square to scan at
+            // a gate, a barcode to swipe — and what is encoded is the field's
+            // own value, so nothing new has to be collected to produce one.
+            $options = $this->optionsOf($var);
+            $kind    = strtolower((string) ($options['kind'] ?? 'text'));
+
             $fontSize = (float) ($var['font_size'] ?? 12);
             $color = $var['color'] ?? '#000000';
             $fontFamily = $var['font_family'] ?? 'Arial';
@@ -161,12 +221,164 @@ class CertificatePDFService
                 $b = hexdec(substr($hex, 4, 2));
             }
 
+            if ($kind === 'qrcode' || $kind === 'barcode') {
+                $this->placeCode($pdf, $kind, (string) $value, $x, $y, $options, $r, $g, $b);
+
+                continue;
+            }
+
             $pdf->SetTextColor($r, $g, $b);
             $pdf->SetFont($tcpdfFont, '', $fontSize);
 
-            $pdf->SetXY($x, $y);
-            $pdf->Cell(0, 0, $value, 0, 0, $align);
+            $this->place($pdf, $value, $x, $y, $align);
         }
+    }
+
+    /**
+     * A field's extra settings, whatever shape they arrived in.
+     *
+     * The column holds JSON, but it has been written to by more than one thing
+     * over the years and sometimes already comes back decoded.
+     *
+     * @return array<string, mixed>
+     */
+    private function optionsOf(array $var): array
+    {
+        $options = $var['options'] ?? null;
+
+        if (is_array($options)) {
+            return $options;
+        }
+
+        if (is_string($options) && $options !== '') {
+            $decoded = json_decode($options, true);
+
+            return is_array($decoded) ? $decoded : [];
+        }
+
+        return [];
+    }
+
+    /**
+     * Draws a QR square or a barcode, centred on the point it was placed at.
+     *
+     * Sized like everything else here: in the artwork's own pixels, so a code
+     * keeps its proportions relative to the design whatever the page is
+     * printed at. A barcode with no height given gets a third of its width,
+     * which is about what a scanner wants; a QR code is square by definition.
+     */
+    private function placeCode(
+        TCPDF $pdf,
+        string $kind,
+        string $value,
+        float $x,
+        float $y,
+        array $options,
+        int $r,
+        int $g,
+        int $b
+    ): void {
+        if (trim($value) === '') {
+            return;
+        }
+
+        $width = ((float) ($options['w'] ?? 0)) * $this->pixelsToMm;
+
+        if ($width <= 0) {
+            $width = $kind === 'qrcode' ? 20.0 : 40.0;
+        }
+
+        $height = ((float) ($options['h'] ?? 0)) * $this->pixelsToMm;
+
+        if ($height <= 0) {
+            $height = $kind === 'qrcode' ? $width : $width / 3;
+        }
+
+        // Centred on the marker, as text is.
+        $left = $x - ($width / 2);
+        $top  = $y - ($height / 2);
+
+        $style = [
+            'border'        => false,
+            'padding'       => 0,
+            'fgcolor'       => [$r, $g, $b],
+            'bgcolor'       => false,
+            'module_width'  => 1,
+            'module_height' => 1,
+        ];
+
+        if ($kind === 'qrcode') {
+            $level = strtoupper((string) ($options['level'] ?? 'M'));
+
+            if (!in_array($level, ['L', 'M', 'Q', 'H'], true)) {
+                $level = 'M';
+            }
+
+            $pdf->write2DBarcode($value, 'QRCODE,' . $level, $left, $top, $width, $height, $style, 'N');
+
+            return;
+        }
+
+        $symbology = strtoupper((string) ($options['symbology'] ?? 'C128'));
+
+        // Only the symbologies TCPDF can actually draw, so a typo in the
+        // layout does not become an exception in the middle of a batch.
+        if (!in_array($symbology, self::BARCODE_TYPES, true)) {
+            $symbology = 'C128';
+        }
+
+        $style['text']     = (bool) ($options['show_text'] ?? false);
+        $style['stretch']  = true;
+        $style['fontsize'] = 6;
+
+        $pdf->write1DBarcode($value, $symbology, $left, $top, $width, $height, null, $style, 'N');
+    }
+
+    /**
+     * Draws a line of text centred on the point it was placed at.
+     *
+     * The marker in the layout editor sits on its own centre — you drag a
+     * label and the label straddles the cursor — so that is what the position
+     * has always meant, and the renderer now means the same thing by it.
+     *
+     * Three things were in the way.
+     *
+     * Cell() refuses to be shorter than one line: a height of zero quietly
+     * becomes the font's line height, and the text was then centred inside
+     * that invented box rather than on the point. The error grew with the font
+     * size, which is backwards — a large field is one somebody placed with
+     * more care, not less.
+     *
+     * Alignment was measured against the paper. Asking for centred text
+     * centred it between the field and the far edge of the page, which is not
+     * what choosing "centre" on a dragged marker means. Here the marker is the
+     * anchor: left starts at it, centre straddles it, right ends at it.
+     *
+     * And aligning to the top of a line is not the same as aligning to the
+     * top of the letters: TCPDF's line top is the ascender, high enough to
+     * clear accents no capital reaches, which still left the text sitting low.
+     *
+     * Asking for a box of no height and centred contents is what does it. The
+     * arithmetic is TCPDF's own, against the font's real ascent and descent —
+     * worth noting because getFontAscent() is not: it re-resolves the font by
+     * name and hands back a figure for a different one, 2.09mm where the font
+     * in use ascends 5.91mm. Anything built on that number is quietly wrong.
+     */
+    private function place(TCPDF $pdf, string $value, float $x, float $y, string $align): void
+    {
+        $width = $pdf->GetStringWidth($value);
+
+        $left = match ($align) {
+            'C' => $x - ($width / 2),
+            'R' => $x - $width,
+            default => $x,
+        };
+
+        $pdf->SetXY($left, $y);
+
+        // ignore_min_height keeps the height at nothing, and centring within
+        // nothing puts the middle of the em box on the point.
+        $pdf->Cell($width, 0, $value, 0, 0, 'L', false, '', 0, true, 'T', 'M');
     }
 
     /**

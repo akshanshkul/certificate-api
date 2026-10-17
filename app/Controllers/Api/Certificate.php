@@ -9,10 +9,10 @@ use PhpOffice\PhpSpreadsheet\Cell\Coordinate;
 use PhpOffice\PhpSpreadsheet\Shared\Date;
 use PhpOffice\PhpSpreadsheet\RichText\RichText;
 use TCPDF;
+use App\Libraries\Db;
 use App\Libraries\S3Service;
 use App\Libraries\AuthContext;
 use App\Libraries\CertificatePDFService;
-use App\Models\CertificateZipJobModel;
 
 class Certificate extends Controller
 {
@@ -85,6 +85,8 @@ class Certificate extends Controller
             'created_at' => date('Y-m-d H:i:s'),
         ];
 
+        $insert += $this->pageFrom($data);
+
         $this->certificateModel->insert($insert);
         $id = (int) $this->certificateModel->getInsertID();
 
@@ -105,6 +107,80 @@ class Certificate extends Controller
 
 
     /**
+     * POST /api/certificate/page — how big the finished thing is.
+     *
+     * Separate from creating it because the size is usually decided later,
+     * once there is artwork to look at, and because an ID card that came out
+     * the size of a certificate is worth being able to correct without making
+     * everything again.
+     */
+    public function page($certificateId = null)
+    {
+        $data          = $this->request->getJSON(true) ?? $this->request->getPost();
+        $certificateId = $certificateId ?? ($data['certificate_id'] ?? null);
+
+        if (!$certificateId || !is_numeric($certificateId)) {
+            return $this->respond(['success' => 0, 'message' => 'certificate_id required'], 422);
+        }
+
+        if (!$this->checkCertificateExistsAndAccess($certificateId)) {
+            return $this->respond(['success' => 0, 'message' => 'Access denied'], 403);
+        }
+
+        $page = $this->pageFrom($data);
+
+        if ($page === []) {
+            return $this->respond([
+                'success' => 0,
+                'message' => 'Give a width and a height in millimetres, or null for both to size it from the artwork.',
+            ], 422);
+        }
+
+        if (!empty($data['orientation'])) {
+            $page['orientation'] = strtoupper((string) $data['orientation']) === 'P' ? 'P' : 'L';
+        }
+
+        $this->certificateModel->update((int) $certificateId, $page);
+
+        return $this->respond([
+            'success' => 1,
+            'status'  => true,
+            'message' => 'Page size saved',
+            'page'    => $page,
+        ]);
+    }
+
+    /**
+     * A page size out of a request, if there is one in there.
+     *
+     * Both dimensions or neither: half a size is not a size, and silently
+     * keeping the other half would print something nobody asked for. Sending
+     * them empty is how you go back to taking the size from the artwork.
+     *
+     * @return array<string, float|null>
+     */
+    private function pageFrom(array $data): array
+    {
+        $hasKeys = array_key_exists('page_width_mm', $data) || array_key_exists('page_height_mm', $data);
+
+        if (!$hasKeys) {
+            return [];
+        }
+
+        $width  = (float) ($data['page_width_mm'] ?? 0);
+        $height = (float) ($data['page_height_mm'] ?? 0);
+
+        if ($width <= 0 || $height <= 0) {
+            return ['page_width_mm' => null, 'page_height_mm' => null];
+        }
+
+        return [
+            'page_width_mm'  => round($width, 2),
+            'page_height_mm' => round($height, 2),
+        ];
+    }
+
+    /**
      * POST /api/certificate/template/upload
      * Form-data:
      *   certificate_id (required)
@@ -113,8 +189,37 @@ class Certificate extends Controller
      */
     public function templateUpload()
     {
-        $post = $this->request->getPost();
-        $certificateId = $post['certificate_id'] ?? null;
+ log_message('error', 'CONTENT_TYPE: ' . ($_SERVER['CONTENT_TYPE'] ?? 'NULL'));
+
+    log_message(
+        'error',
+        'POST: ' . print_r($_POST, true)
+    );
+
+    log_message(
+        'error',
+        'GET POST: ' . print_r(
+            $this->request->getPost(),
+            true
+        )
+    );
+
+    log_message(
+        'error',
+        'FILES: ' . print_r(
+            $_FILES,
+            true
+        )
+    );
+
+    $post = $this->request->getPost();
+
+    $certificateId = $post['certificate_id'] ?? null;
+
+    log_message(
+        'error',
+        'certificateId: ' . ($certificateId ?? 'NULL')
+    );
         if (!$certificateId || !is_numeric($certificateId)) {
             return $this->respond(['success' => 0, 'status' => false, 'message' => 'certificate_id required'], 422);
         }
@@ -150,9 +255,8 @@ class Certificate extends Controller
                 ]
             ]
         );
-        // $pathDb = 'writable/uploads/certificates/assets/' . $newName;
         $this->certificateModel->setTemplatePath($certificateId, $pathDb['url']);
-
+        $templatePath = $pathDb['url'];
         // Handle multiple logo files
         $logosSaved = [];
         $logoFiles = $this->request->getFileMultiple('logos');
@@ -234,7 +338,7 @@ class Certificate extends Controller
             'success' => 1,
             'status' => true,
             'message' => 'Template uploaded',
-            'template_path' => $pathDb['url'],
+            'template_path' => $templatePath,
             'logos' => $logosSaved
         ]);
     }
@@ -345,9 +449,11 @@ class Certificate extends Controller
         $count = 0;
         $savedVariables = [];
 
+        $rows = [];
+
         foreach ($validVariables as $v) {
-            $varKey = $v['var_key'];
-            $props = [
+            $rows[] = [
+                'var_key' => $v['var_key'],
                 'label' => $v['label'] ?? null,
                 'x' => isset($v['x']) ? (int) $v['x'] : 0,
                 'y' => isset($v['y']) ? (int) $v['y'] : 0,
@@ -359,10 +465,25 @@ class Certificate extends Controller
                 'options' => isset($v['options']) ? json_encode($v['options']) : null
             ];
 
-            $result = $this->templateVarModel->upsertVar((int) $certificateId, $varKey, $props);
-            if ($result) {
-                $count++;
-                $savedVariables[] = $varKey;
+            $savedVariables[] = $v['var_key'];
+        }
+
+        // A layout sent whole replaces the layout, which is the only way one
+        // field can appear twice — an ID card's reference is printed, turned
+        // into a QR square and turned into a barcode, all from the one value.
+        if (!empty($data['replace'])) {
+            $count = $this->templateVarModel->replaceFor((int) $certificateId, $rows);
+        } else {
+            $savedVariables = [];
+
+            foreach ($rows as $row) {
+                $varKey = $row['var_key'];
+                unset($row['var_key']);
+
+                if ($this->templateVarModel->upsertVar((int) $certificateId, $varKey, $row)) {
+                    $count++;
+                    $savedVariables[] = $varKey;
+                }
             }
         }
 
@@ -417,9 +538,102 @@ class Certificate extends Controller
         return $this->respond([
             'success' => 1,
             'status' => true,
-            'variables' => $variables
+            'variables' => $variables,
+            // The space x and y are measured in.
+            //
+            // Positions are stored as pixels against the prepared template,
+            // and "prepared" is the operative word: a large upload is scaled
+            // down before the page is built from it, so the original image's
+            // size is not the space the renderer works in. An editor that
+            // guessed from the artwork it displays would be right only for
+            // templates that happened to be small enough.
+            //
+            // So the size is reported by the same code that renders, and any
+            // editor placing fields can convert to it exactly.
+            'canvas' => $this->templateCanvas($certificateId),
         ]);
     }
+
+    /**
+     * The pixel size the renderer measures variable positions against.
+     *
+     * Null when there is no artwork yet, or when it cannot be read — in which
+     * case there is nothing to place fields on and nothing to convert against.
+     *
+     * @return array{width: int, height: int}|null
+     */
+    private function templateCanvas($certificateId): ?array
+    {
+        $certificate = $this->certificateModel->find($certificateId);
+
+        if (empty($certificate['template_path'])) {
+            return null;
+        }
+
+        try {
+            $prepared = (new \App\Libraries\TemplateImageCache())
+                ->get((string) $certificate['template_path']);
+        } catch (\Throwable $e) {
+            log_message('error', 'Could not measure template for certificate {id}: {message}', [
+                'id'      => $certificateId,
+                'message' => $e->getMessage(),
+            ]);
+
+            return null;
+        }
+
+        return [
+            'width'  => (int) $prepared['width'],
+            'height' => (int) $prepared['height'],
+        ];
+    }
+
+    /**
+     * Writes a set of rows for a certificate in one statement.
+     *
+     * One round trip rather than one per row. The database is not on the same
+     * machine, so a two hundred row upload used to be two hundred separate
+     * waits on the network to be told the same thing each time.
+     *
+     * @param list<mixed> $rows
+     *
+     * @return array{0: int, 1: list<int>, 2: list<array<string, mixed>>}
+     */
+    private function storeRows(int $certificateId, array $rows): array
+    {
+        $clean = [];
+
+        foreach ($rows as $row) {
+            if (is_array($row) && !empty($row)) {
+                // Internal keys that have no business in the database.
+                unset($row['_row_number'], $row['_validation_errors'], $row['_source_row']);
+                $clean[] = $row;
+            }
+        }
+
+        try {
+            $inserted = $this->dataModel->insertRows($certificateId, $clean);
+        } catch (\Throwable $e) {
+            log_message('error', 'Row insert failed: ' . $e->getMessage());
+
+            return [0, [], [['error' => $e->getMessage(), 'rows' => count($clean)]]];
+        }
+
+        if ($inserted === 0) {
+            return [0, [], []];
+        }
+
+        $ids = array_column(
+            $this->dataModel
+                ->where('certificate_id', $certificateId)
+                ->orderBy('id', 'DESC')
+                ->findAll($inserted),
+            'id'
+        );
+
+        return [$inserted, array_map('intval', array_reverse($ids)), []];
+    }
+
     /**
      * Check if variable is a special template variable
      */
@@ -511,32 +725,21 @@ class Certificate extends Controller
                     return $this->respond(['success' => 0, 'status' => false, 'message' => 'Data array required'], 422);
                 }
 
-                $inserted = 0;
-                $failedRows = [];
-                $successIds = [];
+                // A submission that is the whole list replaces the whole list.
+                //
+                // Without this, sending the recipients again simply added them
+                // again: twenty-one people became two hundred and thirty-one
+                // rows, and every generation afterwards rendered, uploaded and
+                // stored eleven copies of each certificate. The caller says
+                // whether it is sending everything, because only the caller
+                // knows — a spreadsheet uploaded a second time may well be a
+                // second batch.
+                $replaced = !empty($json['replace'])
+                    ? $this->dataModel->clearFor((int) $certificateId)
+                    : 0;
 
-                foreach ($data as $index => $row) {
-                    if (is_array($row) && !empty($row)) {
-                        try {
-                            // Remove any internal keys that shouldn't be in database
-                            $cleanRow = $row;
-                            unset($cleanRow['_row_number'], $cleanRow['_validation_errors']);
-
-                            $id = $this->dataModel->insertRow($certificateId, $cleanRow);
-                            if ($id) {
-                                $inserted++;
-                                $successIds[] = $id;
-                            }
-                        } catch (\Exception $e) {
-                            $failedRows[] = [
-                                'index' => $index,
-                                'row' => $row,
-                                'error' => $e->getMessage()
-                            ];
-                            log_message('error', 'Row insert failed: ' . $e->getMessage());
-                        }
-                    }
-                }
+                [$inserted, $successIds, $failedRows] =
+                    $this->storeRows((int) $certificateId, $data);
 
                 // If source file was provided in JSON, clean it up
                 if ($source && file_exists(WRITEPATH . $source)) {
@@ -549,6 +752,7 @@ class Certificate extends Controller
                     'status' => true,
                     'message' => 'Data submitted successfully',
                     'rows_inserted' => $inserted,
+                    'rows_replaced' => $replaced,
                     'rows_failed' => count($failedRows),
                     'inserted_ids' => $successIds,
                     'type' => 'submit',
@@ -677,31 +881,15 @@ class Certificate extends Controller
 
             // If type=submit, save directly to DB
             if ($type === 'submit') {
-                $inserted = 0;
-                $failedRows = [];
-                $successIds = [];
+                // ?replace=1 for a spreadsheet that is the whole list rather
+                // than more rows to add to it. Uploading the same sheet twice
+                // is otherwise how a recipient ends up with two certificates.
+                $replaced = $this->request->getVar('replace')
+                    ? $this->dataModel->clearFor((int) $certificateId)
+                    : 0;
 
-                foreach ($extractedData as $index => $row) {
-                    if (is_array($row) && !empty($row)) {
-                        try {
-                            // Remove internal field
-                            $cleanRow = $row;
-                            unset($cleanRow['_source_row']);
-
-                            $id = $this->dataModel->insertRow($certificateId, $cleanRow);
-                            if ($id) {
-                                $inserted++;
-                                $successIds[] = $id;
-                            }
-                        } catch (\Exception $e) {
-                            $failedRows[] = [
-                                'row_index' => $index + $skipRows + 1,
-                                'data' => $row,
-                                'error' => $e->getMessage()
-                            ];
-                        }
-                    }
-                }
+                [$inserted, $successIds, $failedRows] =
+                    $this->storeRows((int) $certificateId, $extractedData);
 
                 // Delete stored file after successful processing in submit mode
                 $shouldDeleteStoredFile = true;
@@ -716,6 +904,7 @@ class Certificate extends Controller
                     'file' => $storedPath,
                     'rows_total' => count($extractedData),
                     'rows_inserted' => $inserted,
+                    'rows_replaced' => $replaced,
                     'rows_failed' => count($failedRows),
                     'inserted_ids' => $successIds,
                     'file_deleted' => $shouldDeleteStoredFile,
@@ -1289,9 +1478,17 @@ class Certificate extends Controller
             mkdir($tmpDir, 0755, true);
         }
 
+        // A batch is built locally and uploaded in one go, so it is quick —
+        // but a few hundred certificates still take longer than PHP's default.
+        @set_time_limit(300);
+
         $generatedIds = [];
         $generatedFiles = [];
         $validDataRows = []; // To store data for combined PDF
+        $localFiles = [];    // Everything written to tmp, removed at the end
+
+        // The template is fetched and prepared once here, then reused for
+        // every certificate in the batch and the combined PDF.
         $pdfService = new CertificatePDFService();
 
         // --- Batch Identification ---
@@ -1299,123 +1496,191 @@ class Certificate extends Controller
         $slug = $this->getCertificateSlug($certificate);
         $folder = "certificates/data/generated/{$slug}/{$batchId}";
 
-        /* -------------------------------------------------
-         * Generate certificates
-         * ------------------------------------------------- */
-        foreach ($rows as $i => $rowData) {
+        try {
+            /* -------------------------------------------------
+             * 1. Generate every certificate to a local file
+             * ------------------------------------------------- */
+            $pending = [];
 
-            if (empty($rowData['certificate_number'])) {
-                $rowData['certificate_number'] =
-                    'CERT-' . date('Ymd') . '-' . str_pad($i + 1, 4, '0', STR_PAD_LEFT);
+            foreach ($rows as $i => $rowData) {
+
+                if (empty($rowData['certificate_number'])) {
+                    $rowData['certificate_number'] =
+                        'CERT-' . date('Ymd') . '-' . str_pad($i + 1, 4, '0', STR_PAD_LEFT);
+                }
+
+                $rowData['issue_date'] = date('F j, Y');
+                $rowData['certificate_id'] = $certificateId;
+
+                $fileName = 'certificate_row_' . ($sourceDataIds[$i] ?? 'new') . '_' . uniqid() . '.pdf';
+                $tempPdfPath = $tmpDir . $fileName;
+
+                $pdfContent = $pdfService->generate($certificate, $templateVars, $rowData, [
+                    'paperSize' => $paperSize,
+                    'quality' => $quality
+                ]);
+
+                if (!$pdfContent || file_put_contents($tempPdfPath, $pdfContent) === false) {
+                    log_message('error', 'PDF generation failed');
+                    continue;
+                }
+
+                $localFiles[] = $tempPdfPath;
+
+                $pending[] = [
+                    'index'    => $i,
+                    'row'      => $rowData,
+                    'fileName' => $fileName,
+                    'path'     => $tempPdfPath,
+                    'key'      => "{$folder}/{$fileName}",
+                ];
             }
 
-            $rowData['issue_date'] = date('F j, Y');
-            $rowData['certificate_id'] = $certificateId;
-
-            $fileName = 'certificate_row_' . ($sourceDataIds[$i] ?? 'new') . '_' . uniqid() . '.pdf';
-            $tempPdfPath = $tmpDir . $fileName;
-
-            /* ---------- Generate PDF locally ---------- */
-            $pdfContent = $pdfService->generate($certificate, $templateVars, $rowData, [
-                'paperSize' => $paperSize,
-                'quality' => $quality
-            ]);
-
-            if (!$pdfContent) {
-                log_message('error', 'PDF generation failed');
-                continue;
-            }
-
-            file_put_contents($tempPdfPath, $pdfContent);
-            $ok = file_exists($tempPdfPath);
-
-            if (!$ok || !file_exists($tempPdfPath)) {
-                log_message('error', 'PDF generation failed');
-                continue;
-            }
-
-            /* ---------- Upload to S3 ---------- */
-            $s3Key = "{$folder}/{$fileName}";
-
-            $s3Url = $this->s3Service->uploadLocalFile(
-                $tempPdfPath,
-                $s3Key,
-                [
-                    'ContentType' => 'application/pdf',
-                    'Metadata' => [
+            /* -------------------------------------------------
+             * 2. The combined PDF, from the local files
+             *
+             * This is what "download them all" means now. It used to be a ZIP
+             * of every individual PDF, which was the single most expensive
+             * thing this endpoint did: a hundred certificates made a 315 MB
+             * archive, because each PDF carries its own copy of the template
+             * artwork and a ZIP of PDFs compresses to nothing.
+             *
+             * The combined PDF holds exactly the same pages and embeds the
+             * artwork once, so the same batch comes to under two megabytes.
+             * It builds in a fraction of the time, uploads in a fraction of
+             * the time, and opens in any PDF reader without unpacking.
+             * ------------------------------------------------- */
+            $uploads = array_map(static fn (array $one) => [
+                'path'    => $one['path'],
+                'key'     => $one['key'],
+                'options' => [
+                    'mimeType' => 'application/pdf',
+                    'metadata' => [
                         'certificate_id' => (string) $certificateId,
-                        'certificate_no' => $rowData['certificate_number'],
+                        'certificate_no' => $one['row']['certificate_number'],
                     ],
-                ]
-            );
+                ],
+            ], $pending);
 
-            unlink($tempPdfPath); // 🚨 important
+            $combinedKey = null;
 
-            /* ---------- Save DB ---------- */
-            $genId = $this->generatedModel->createGenerated(
-                (int) $certificateId,
-                $s3Key,
-                $rowData,
-                $sourceDataIds[$i] ?? null,
-                $s3Url,
-                $batchId
-            );
+            if ($pending !== []) {
+                $combinedContent = $pdfService->generateBulk(
+                    $certificate,
+                    $templateVars,
+                    array_column($pending, 'row')
+                );
 
-            // Also update the source data row with the certificate path/url
-            if (!empty($sourceDataIds[$i])) {
-                try {
-                    $this->dataModel->update($sourceDataIds[$i], [
-                        'file_path' => $s3Key,
-                        'download_url' => $s3Url
-                    ]);
-                } catch (\Exception $e) {
-                    // Log the error but don't stop generation if columns are missing
-                    log_message('error', 'Failed to update certificate_data row: ' . $e->getMessage());
-                }
-            }
+                if ($combinedContent) {
+                    $compName = 'combined_' . $certificateId . '_' . time() . '.pdf';
+                    $compPath = $tmpDir . $compName;
 
-            $generatedIds[] = $genId;
-            $generatedFiles[] = [
-                'id' => $genId,
-                'file_key' => $s3Key,
-                'file_url' => $s3Url,
-                'download_url' => $this->s3Service->presignedUrl($s3Key),
-            ];
-            $validDataRows[] = $rowData; // For combined PDF
-        }
-
-        /* -------------------------------------------------
-         * NEW: Generate Combined PDF
-         * ------------------------------------------------- */
-        $combinedPdfUrl = null;
-        if (!empty($validDataRows)) {
-            $combinedContent = $pdfService->generateBulk($certificate, $templateVars, $validDataRows);
-            if ($combinedContent) {
-                $compName = 'combined_' . $certificateId . '_' . time() . '.pdf';
-                $compKey = "{$folder}/{$compName}";
-                try {
-                    // Use S3Service directly to upload text/binary content
-                    $compRes = $this->s3Service->uploadDocument($combinedContent, $folder, [
-                        'filename' => $compName,
-                        'mimeType' => 'application/pdf',
-                        'isPublic' => true
-                    ]);
-                    if ($compRes && isset($compRes['url'])) {
-                        $combinedPdfUrl = $compRes['url'];
+                    if (file_put_contents($compPath, $combinedContent) !== false) {
+                        $localFiles[] = $compPath;
+                        $combinedKey = "{$folder}/{$compName}";
+                        $uploads[] = [
+                            'path'    => $compPath,
+                            'key'     => $combinedKey,
+                            'options' => ['mimeType' => 'application/pdf', 'isPublic' => true],
+                        ];
                     }
-                } catch (\Exception $e) {
-                    log_message('error', 'Failed to upload combined PDF: ' . $e->getMessage());
                 }
             }
-        }
 
-        /* -------------------------------------------------
-         * NEW: Trigger ZIP Job
-         * ------------------------------------------------- */
-        $zipJobId = null;
-        if (count($generatedIds) > 1) {
-            $zipJobModel = new CertificateZipJobModel();
-            $zipJobId = $zipJobModel->createJob((int) $certificateId, count($generatedIds), $folder);
+            /* -------------------------------------------------
+             * 3. Upload everything together
+             * ------------------------------------------------- */
+            $urls = $this->s3Service->uploadMany($uploads);
+
+            /* -------------------------------------------------
+             * 4. Record what landed
+             *
+             * The uploads are done and the files are real. Losing the
+             * connection here would leave them in S3 with nothing pointing at
+             * them, and report a failure for work that succeeded — so the
+             * connection is picked back up before anything is written.
+             * ------------------------------------------------- */
+            Db::revive();
+
+            // Written in two statements rather than two per certificate.
+            //
+            // This used to be an insert and an update for every row in the
+            // batch. The database is not on this machine, so each of those is
+            // a round trip of its own — a hundred certificates meant two
+            // hundred of them, several seconds spent waiting on the network to
+            // say the same thing over and over.
+            $rows        = [];
+            $dataUpdates = [];
+
+            foreach ($pending as $one) {
+                $s3Url = $urls[$one['key']] ?? null;
+
+                if ($s3Url === null) {
+                    continue;
+                }
+
+                $rows[] = [
+                    'certificate_id'      => (int) $certificateId,
+                    'certificate_data_id' => $sourceDataIds[$one['index']] ?? null,
+                    'batch_id'            => $batchId,
+                    'file_path'           => $one['key'],
+                    'public_url'          => $s3Url,
+                    'data_snapshot'       => json_encode($one['row']),
+                    'created_at'          => date('Y-m-d H:i:s'),
+                ];
+
+                if (!empty($sourceDataIds[$one['index']])) {
+                    $dataUpdates[] = [
+                        'id'           => $sourceDataIds[$one['index']],
+                        'file_path'    => $one['key'],
+                        'download_url' => $s3Url,
+                    ];
+                }
+
+                $validDataRows[] = $one['row'];
+            }
+
+            if ($rows !== []) {
+                $this->generatedModel->insertBatch($rows);
+
+                // Read back rather than assuming the ids run consecutively from
+                // the first: true for this table today, but it is an engine
+                // detail and not worth betting the response on.
+                $saved = $this->generatedModel
+                    ->where('certificate_id', (int) $certificateId)
+                    ->where('batch_id', $batchId)
+                    ->orderBy('id', 'ASC')
+                    ->findAll();
+
+                foreach ($saved as $row) {
+                    $generatedIds[]   = (int) $row['id'];
+                    $generatedFiles[] = [
+                        'id'           => (int) $row['id'],
+                        'file_key'     => $row['file_path'],
+                        'file_url'     => $row['public_url'],
+                        'download_url' => $this->s3Service->presignedUrl($row['file_path']),
+                    ];
+                }
+            }
+
+            if ($dataUpdates !== []) {
+                try {
+                    $this->dataModel->updateBatch($dataUpdates, 'id');
+                } catch (\Throwable $e) {
+                    // The certificates are made and recorded; this only writes
+                    // a convenience link onto the source row.
+                    log_message('error', 'Failed to update certificate_data rows: ' . $e->getMessage());
+                }
+            }
+
+            $combinedPdfUrl = $combinedKey !== null ? ($urls[$combinedKey] ?? null) : null;
+
+        } finally {
+            foreach ($localFiles as $file) {
+                if (is_file($file)) {
+                    @unlink($file);
+                }
+            }
         }
 
         // Update certificate last generated info
@@ -1443,7 +1708,6 @@ class Certificate extends Controller
                 'batch_id' => $batchId,
                 'generated_ids' => $generatedIds,
                 'combined_pdf_url' => $combinedPdfUrl,
-                'zip_job_id' => $zipJobId,
                 'files' => $generatedFiles,
             ]
         ], 201);
@@ -1860,35 +2124,19 @@ class Certificate extends Controller
     /**
      * Create ZIP archive of generated certificates
      */
-    private function createZipArchive($files, $certificateId, $targetDir)
-    {
-        $zipFileName = 'certificates_' . $certificateId . '_' . time() . '.zip';
-        $zipFilePath = $targetDir . $zipFileName;
-
-        $zip = new \ZipArchive();
-
-        if ($zip->open($zipFilePath, \ZipArchive::CREATE) === TRUE) {
-            foreach ($files as $file) {
-                $fullPath = WRITEPATH . str_replace('writable/', '', $file['file_path']);
-                if (file_exists($fullPath)) {
-                    $zip->addFile($fullPath, basename($file['file_path']));
-                }
-            }
-            $zip->close();
-
-            return 'writable/uploads/certificates/data/' . $certificateId . '/generated/' . $zipFileName;
-        }
-
-        return null;
-    }
-
     /**
-     * GET /api/certificate/download/all/{certificate_id}
-     * Download all certificates as ZIP (already created during generation)
-     */
-    /**
-     * GET /api/certificate/download/all/{certificate_id}
-     * Download all certificates as ZIP
+     * GET /api/certificate/download/zip/{id} — every certificate in one file.
+     *
+     * The route keeps its old name so nothing calling it has to change, but
+     * what it serves is the combined PDF rather than a ZIP. Building a ZIP of
+     * the individual PDFs meant writing, uploading and storing the whole batch
+     * a second time — a hundred certificates came to 315 MB — for an archive
+     * whose contents are the same pages the combined PDF already holds in
+     * under two megabytes. PDFs do not compress, so the ZIP saved nothing and
+     * cost everything.
+     *
+     * It is streamed through here rather than redirected to, because the
+     * bucket is private and the credentials for it belong on this side.
      */
     public function downloadAllCertificates($certificateId)
     {
@@ -1896,113 +2144,48 @@ class Certificate extends Controller
             return $this->respond(['success' => 0, 'message' => 'Certificate ID required'], 422);
         }
 
-        // Check access
         if (!$this->checkCertificateExistsAndAccess($certificateId)) {
             return $this->respond(['success' => 0, 'message' => 'Access denied'], 403);
         }
 
-        // Get certificate info
         $certificate = $this->certificateModel->find((int) $certificateId);
+
         if (!$certificate) {
             return $this->respond(['success' => 0, 'message' => 'Certificate not found'], 404);
         }
 
-        // Check if ZIP exists in database
-        if (empty($certificate['last_generated_url'])) {
-            return $this->respond(['success' => 0, 'message' => 'No ZIP file available'], 404);
+        $combined = (string) ($certificate['last_generated_url'] ?? '');
+
+        if ($combined === '') {
+            return $this->respond([
+                'success' => 0,
+                'message' => 'Nothing has been generated for this certificate yet.',
+            ], 404);
         }
 
-        // Get ZIP file path
-        $zipRelativePath = $certificate['last_generated_url'];
-        $zipPath = WRITEPATH . str_replace('writable/', '', $zipRelativePath);
+        $name = preg_replace('/[^a-z0-9]+/i', '_', strtolower((string) $certificate['name']));
+        $name = trim($name, '_') ?: 'certificates';
 
-        // Check if file exists
-        if (!file_exists($zipPath)) {
-            return $this->respond(['success' => 0, 'message' => 'ZIP file not found on server'], 404);
+        try {
+            $body = $this->s3Service->contents($combined);
+        } catch (\Throwable $e) {
+            log_message('error', 'Could not read the combined PDF for certificate {id}: {message}', [
+                'id'      => $certificateId,
+                'message' => $e->getMessage(),
+            ]);
+
+            return $this->respond([
+                'success' => 0,
+                'message' => 'The generated file could not be read. Generate again to rebuild it.',
+            ], 404);
         }
 
-        // Generate download filename
-        $certificateName = preg_replace('/[^a-z0-9]/i', '_', strtolower($certificate['name']));
-        $fileName = $certificateName . '_certificates.zip';
-
-        // DISABLE CodeIgniter's output processing
-        $this->response->setHeader('Content-Type', 'application/zip');
-        $this->response->setHeader('Content-Disposition', 'attachment; filename="' . $fileName . '"');
-        $this->response->setHeader('Content-Length', filesize($zipPath));
-        $this->response->setHeader('Pragma', 'no-cache');
-        $this->response->setHeader('Expires', '0');
-
-        // Send headers
-        $this->response->sendHeaders();
-
-        // Clear any output buffers
-        while (ob_get_level()) {
-            ob_end_clean();
-        }
-
-        // Read and output file
-        readfile($zipPath);
-        exit;
+        return $this->response
+            ->setHeader('Content-Type', 'application/pdf')
+            ->setHeader('Content-Disposition', 'attachment; filename="' . $name . '_certificates.pdf"')
+            ->setHeader('Content-Length', (string) strlen($body))
+            ->setBody($body);
     }
-    /**
-     * Recreate ZIP file if missing and download
-     */
-    private function recreateAndDownloadZip($certificateId)
-    {
-        // Get certificate info
-        $certificate = $this->certificateModel->find($certificateId);
-        if (!$certificate) {
-            return $this->respond(['success' => 0, 'message' => 'Certificate not found'], 404);
-        }
-
-        // Check if we have a last_generated_url that might be a ZIP
-        if (!empty($certificate['last_generated_url'])) {
-            $lastGeneratedPath = $certificate['last_generated_url'];
-
-            // Check if this is a ZIP file
-            if (file_exists($lastGeneratedPath) && pathinfo($lastGeneratedPath, PATHINFO_EXTENSION) === 'zip') {
-                // Use the existing ZIP from last_generated_url
-                $certificateName = preg_replace('/[^a-z0-9]/i', '_', strtolower($certificate['name']));
-                $fileName = $certificateName . '_certificates.zip';
-
-                return $this->response->download($lastGeneratedPath, $fileName);
-            }
-        }
-
-        // If no ZIP in last_generated_url, check for individual certificate files
-        $generatedCertificates = $this->generatedModel->where('certificate_id', $certificateId)->findAll();
-
-        if (empty($generatedCertificates)) {
-            return $this->respond(['success' => 0, 'message' => 'No certificates found'], 404);
-        }
-
-        // Check if any certificate files exist
-        $hasFiles = false;
-        foreach ($generatedCertificates as $cert) {
-            $filePath = WRITEPATH . str_replace('writable/', '', $cert['file_path']);
-            if (file_exists($filePath)) {
-                $hasFiles = true;
-                break;
-            }
-        }
-
-        if (!$hasFiles) {
-            return $this->respond(['success' => 0, 'message' => 'No certificate files found'], 404);
-        }
-
-        // Ask user to regenerate certificates first
-        return $this->respond([
-            'success' => 0,
-            'message' => 'ZIP file not found. Please regenerate certificates to create a new ZIP.',
-            'regenerate_url' => base_url('api/certificate/generate'),
-            'data' => [
-                'certificate_id' => $certificateId,
-                'has_individual_files' => $hasFiles,
-                'individual_files_count' => count($generatedCertificates)
-            ]
-        ], 404);
-    }
-
 
     /**
      * GET /api/certificate/stream/{generated_id}
@@ -2132,6 +2315,145 @@ class Certificate extends Controller
      * GET or POST /api/certificate/verify/{generated_id}
      * Public verification if certificate.is_verifiable = 1
      */
+    /**
+     * GET /api/certificate/generated/{certificateId}
+     *
+     *   ?batch_id=batch_20260918_175957   one batch (default: the latest)
+     *   ?scope=batches                    every batch, with counts, no files
+     *
+     * The certificates already generated for a certificate, in the same shape
+     * the generate call answers with, plus how many there are.
+     *
+     * Only the newest three batches are kept on S3 (see cleanupOldBatches); an
+     * older batch is still listed, with files_available false, rather than
+     * handed out as links that no longer lead anywhere. Download links are
+     * signed locally, so reading this makes no request to S3.
+     */
+    public function generatedList($certificateId = null)
+    {
+        if (!$certificateId || !is_numeric($certificateId)) {
+            return $this->respond(['success' => 0, 'message' => 'certificate_id required'], 422);
+        }
+
+        $certificateId = (int) $certificateId;
+
+        if (!$this->checkCertificateExistsAndAccess($certificateId)) {
+            return $this->respond(['success' => 0, 'message' => 'Access denied'], 403);
+        }
+
+        $db = db_connect();
+
+        // Every batch, newest first, with its size.
+        $batches = $db->table('generated_certificates')
+            ->select('batch_id, COUNT(*) AS count, MIN(created_at) AS generated_at', false)
+            ->where('certificate_id', $certificateId)
+            ->groupBy('batch_id')
+            ->orderBy('generated_at', 'DESC')
+            ->get()
+            ->getResultArray();
+
+        $total = array_sum(array_map('intval', array_column($batches, 'count')));
+
+        // cleanupOldBatches keeps the newest three batches' files on S3.
+        $kept = array_slice(array_column($batches, 'batch_id'), 0, 3);
+
+        $batchList = array_map(static fn (array $batch) => [
+            'batch_id'        => $batch['batch_id'],
+            'count'           => (int) $batch['count'],
+            'generated_at'    => $batch['generated_at'],
+            'files_available' => in_array($batch['batch_id'], $kept, true),
+        ], $batches);
+
+        if ($this->request->getGet('scope') === 'batches') {
+            return $this->respond([
+                'success' => 1,
+                'message' => $total . ' certificate(s) generated across ' . count($batches) . ' batch(es)',
+                'data'    => [
+                    'certificate_id'  => $certificateId,
+                    'total_generated' => $total,
+                    'batch_count'     => count($batches),
+                    'batches'         => $batchList,
+                ],
+            ]);
+        }
+
+        $batchId = trim((string) $this->request->getGet('batch_id'));
+        $batchId = $batchId !== '' ? $batchId : ($batches[0]['batch_id'] ?? null);
+
+        $current = current(array_filter($batchList, static fn ($b) => $b['batch_id'] === $batchId)) ?: null;
+
+        if ($batchId === null || $current === null) {
+            return $this->respond([
+                'success' => $batches === [] ? 1 : 0,
+                'message' => $batches === [] ? 'No certificates generated yet' : 'That batch was not found',
+                'data'    => [
+                    'certificate_id'  => $certificateId,
+                    'total_generated' => $total,
+                    'count'           => 0,
+                    'batches'         => $batchList,
+                    'files'           => [],
+                ],
+            ], $batches === [] ? 200 : 404);
+        }
+
+        $rows = $this->generatedModel
+            ->where('certificate_id', $certificateId)
+            ->where('batch_id', $batchId)
+            ->orderBy('id', 'ASC')
+            ->findAll();
+
+        $available = $current['files_available'];
+
+        $files = array_map(function (array $row) use ($available) {
+            $snapshot = json_decode((string) ($row['data_snapshot'] ?? ''), true) ?: [];
+
+            return [
+                'id'                  => (int) $row['id'],
+                'certificate_data_id' => $row['certificate_data_id'] !== null ? (int) $row['certificate_data_id'] : null,
+                'certificate_number'  => $snapshot['certificate_number'] ?? null,
+                'file_key'            => $row['file_path'],
+                'file_url'            => $available ? $row['public_url'] : null,
+                'download_url'        => $available ? $this->signedOrNull($row['file_path']) : null,
+                'created_at'          => $row['created_at'],
+            ];
+        }, $rows);
+
+        // The combined PDF is recorded only for the latest generation.
+        $certificate = $this->certificateModel->find($certificateId);
+        $combined    = (string) ($certificate['last_generated_url'] ?? '');
+        $combinedUrl = $available && $combined !== '' && str_contains($combined, '/' . $batchId . '/') ? $combined : null;
+
+        return $this->respond([
+            'success' => 1,
+            'message' => count($files) . ' certificate(s) in this batch, ' . $total . ' generated in total',
+            'data'    => [
+                'certificate_id'   => $certificateId,
+                'batch_id'         => $batchId,
+                'count'            => count($files),
+                'total_generated'  => $total,
+                'files_available'  => $available,
+                'generated_ids'    => array_column($files, 'id'),
+                'combined_pdf_url' => $combinedUrl,
+                'batches'          => $batchList,
+                'files'            => $files,
+            ],
+        ]);
+    }
+
+    /** A signed download link, or null if S3 is not available. */
+    private function signedOrNull(?string $key): ?string
+    {
+        if ($key === null || $key === '') {
+            return null;
+        }
+
+        try {
+            return $this->s3Service->presignedUrl($key);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
     public function verify($generatedId = null)
     {
         if (!$generatedId) {

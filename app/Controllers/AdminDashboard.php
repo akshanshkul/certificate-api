@@ -8,7 +8,6 @@ use App\Models\CertificateModel;
 use App\Models\GeneratedCertificateModel;
 use App\Models\ClientApiKeyModel;
 use App\Models\UserModel;
-use App\Models\CertificateZipJobModel;
 use App\Libraries\S3Service;
 use App\Libraries\CertificatePDFService;
 
@@ -690,13 +689,6 @@ class AdminDashboard extends BaseController
             }
         }
 
-        // --- Trigger ZIP Job ---
-        $zipJobId = null;
-        if ($successCount > 1) {
-            $zipJobModel = new CertificateZipJobModel();
-            $zipJobId = $zipJobModel->createJob((int) $id, $successCount, $folder);
-        }
-
         // Mark certificate as having generated
         $this->certificateModel->markGenerated($id, $combinedPdfUrl ?: ($generatedResults[0]['url'] ?? null));
 
@@ -716,7 +708,6 @@ class AdminDashboard extends BaseController
             'fail_count' => $failCount,
             'message' => $msg,
             'combined_pdf_url' => $combinedPdfUrl,
-            'zip_job_id' => $zipJobId
         ]);
     }
 
@@ -788,17 +779,10 @@ class AdminDashboard extends BaseController
             ->where('batch_id', $batchId)
             ->findAll();
 
-        // Get ZIP job if exists for this batch
-        $zipJobModel = new CertificateZipJobModel();
-        $zipJob = $zipJobModel->where('certificate_id', $certificateId)
-            ->where('batch_prefix LIKE', "%{$batchId}%")
-            ->first();
-
         return view('admin/certificates/batch_view', [
             'certificate' => $cert,
             'batch_id' => $batchId,
             'certificates' => $certificates,
-            'zip_job' => $zipJob,
             'title' => 'Batch Results - ' . $batchId
         ]);
     }
@@ -823,12 +807,6 @@ class AdminDashboard extends BaseController
         // 2. Delete DB records for this batch
         $this->generatedModel->where('certificate_id', $certId)
             ->where('batch_id', $batchId)
-            ->delete();
-
-        // 3. Delete ZIP job records
-        $zipJobModel = new CertificateZipJobModel();
-        $zipJobModel->where('certificate_id', $certId)
-            ->where('batch_prefix LIKE', "%{$batchId}%")
             ->delete();
 
         return redirect()->to('/admin/certificates/' . $certId . '/batches')->with('success', 'Batch ' . $batchId . ' deleted successfully.');
@@ -863,9 +841,6 @@ class AdminDashboard extends BaseController
         $dataModel->where('certificate_id', $id)->delete();
 
         $this->generatedModel->where('certificate_id', $id)->delete();
-
-        $zipJobModel = new CertificateZipJobModel();
-        $zipJobModel->where('certificate_id', $id)->delete();
 
         // 4. Delete the certificate itself
         $this->certificateModel->delete($id);

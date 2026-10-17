@@ -2,6 +2,7 @@
 
 namespace App\Libraries;
 
+use Aws\CommandPool;
 use Aws\S3\S3Client;
 use Aws\Exception\AwsException;
 use Config\S3 as S3Config;
@@ -49,11 +50,11 @@ class S3Service
                 $clientConfig['use_path_style_endpoint'] = $this->config->usePathStyleEndpoint;
             }
 
+            // No connection test here. Building a client makes no request, and
+            // listing buckets on every construction cost a round trip to S3
+            // each time this class was instantiated — several times per
+            // request. A misconfiguration still surfaces on the first real call.
             $this->s3Client = new S3Client($clientConfig);
-
-            // Test connection
-            $this->s3Client->listBuckets();
-            log_message('info', 'S3 Client initialized successfully');
 
         } catch (AwsException $e) {
             log_message('error', 'S3 Client initialization failed: ' . $e->getMessage());
@@ -311,6 +312,114 @@ class S3Service
         }
     }
 
+    /**
+     * Whether a URL points into this bucket (directly, through the CDN, or
+     * through a custom endpoint), so it can be read with the SDK rather than
+     * fetched over public HTTP.
+     */
+    public function ownsUrl(string $url): bool
+    {
+        if (!$this->s3Client || !filter_var($url, FILTER_VALIDATE_URL)) {
+            return false;
+        }
+
+        if (!empty($this->config->cdnUrl) && str_starts_with($url, rtrim($this->config->cdnUrl, '/') . '/')) {
+            return true;
+        }
+
+        $host = strtolower((string) parse_url($url, PHP_URL_HOST));
+
+        if (!empty($this->config->endpoint)) {
+            $endpointHost = strtolower((string) parse_url($this->config->endpoint, PHP_URL_HOST));
+
+            if ($endpointHost !== '' && str_ends_with($host, $endpointHost)) {
+                return true;
+            }
+        }
+
+        return str_starts_with($host, strtolower((string) $this->bucket) . '.');
+    }
+
+    /**
+     * Upload many local files at once, several in flight together.
+     *
+     * One at a time, a batch of certificates spends most of its time waiting
+     * on round trips. A command pool keeps `$concurrency` uploads going.
+     *
+     * @param list<array{path: string, key: string, options?: array}> $items
+     *
+     * @return array<string, string|null> S3 key => public URL, or null where that upload failed
+     */
+    public function uploadMany(array $items, int $concurrency = 8): array
+    {
+        $results = [];
+
+        if (!$this->s3Client || $items === []) {
+            return $results;
+        }
+
+        $params = array_map(fn (array $item) => $this->putParams($item['path'], $item['key'], $item['options'] ?? []), $items);
+
+        $commands = array_map(fn (array $one) => $this->s3Client->getCommand('PutObject', $one), $params);
+
+        $outcomes = CommandPool::batch($this->s3Client, $commands, ['concurrency' => $concurrency]);
+
+        foreach ($outcomes as $index => $outcome) {
+            $key = $items[$index]['key'];
+
+            if (!$outcome instanceof \Throwable) {
+                $results[$key] = $this->getPublicUrl($key);
+                continue;
+            }
+
+            // Buckets with ACLs disabled reject public-read; retry that one without it.
+            if ($outcome instanceof AwsException
+                && $outcome->getAwsErrorCode() === 'AccessControlListNotSupported'
+                && isset($params[$index]['ACL'])) {
+                try {
+                    $retry = $params[$index];
+                    unset($retry['ACL']);
+                    $this->s3Client->putObject($retry);
+                    $results[$key] = $this->getPublicUrl($key);
+                    continue;
+                } catch (\Throwable $e) {
+                    $outcome = $e;
+                }
+            }
+
+            log_message('error', "S3 upload failed for {$key}: " . $outcome->getMessage());
+            $results[$key] = null;
+        }
+
+        return $results;
+    }
+
+    /** PutObject parameters for a local file, with the same defaults as uploadDocument(). */
+    private function putParams(string $localPath, string $s3Key, array $options): array
+    {
+        $mime = $options['mimeType'] ?? $options['ContentType'] ?? (mime_content_type($localPath) ?: 'application/octet-stream');
+
+        $params = [
+            'Bucket'       => $this->bucket,
+            'Key'          => ltrim($s3Key, '/'),
+            'SourceFile'   => $localPath,
+            'ContentType'  => $mime,
+            'CacheControl' => $options['cacheControl'] ?? 'public, max-age=31536000',
+        ];
+
+        if ($options['isPublic'] ?? $this->config->publicRead) {
+            $params['ACL'] = 'public-read';
+        }
+
+        $metadata = $options['metadata'] ?? $options['Metadata'] ?? [];
+
+        if ($metadata !== []) {
+            $params['Metadata'] = array_map('strval', $metadata);
+        }
+
+        return $params;
+    }
+
     public function isEnabled()
     {
         return $this->config->enabled && $this->s3Client !== null;
@@ -433,6 +542,34 @@ class S3Service
     }
 
 
+
+    /**
+     * An object's bytes, without putting it on disk first.
+     *
+     * For files that are about to be handed straight to a browser: writing a
+     * temporary copy only to read it back and delete it is three pieces of
+     * work where none is needed.
+     *
+     * Accepts a full URL or a bare key, as the rest of this class does, since
+     * what is stored in the database is sometimes one and sometimes the other.
+     */
+    public function contents(string $s3Path): string
+    {
+        if (!$this->s3Client) {
+            throw new \RuntimeException('S3 client not initialized');
+        }
+
+        $key = str_starts_with($s3Path, 'http')
+            ? ltrim((string) parse_url($s3Path, PHP_URL_PATH), '/')
+            : ltrim($s3Path, '/');
+
+        $result = $this->s3Client->getObject([
+            'Bucket' => $this->bucket,
+            'Key'    => $key,
+        ]);
+
+        return (string) $result['Body'];
+    }
 
     /**
      * List sub-folders (prefixes) under a parent prefix

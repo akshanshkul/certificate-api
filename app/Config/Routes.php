@@ -25,8 +25,11 @@ $routes->group('api/certificate', ['filter' => 'apiAuth'], function ($routes) {
     $routes->POST('template/upload', 'Api\Certificate::templateUpload');
     $routes->POST('template/update', 'Api\Certificate::templateUpdate');
     $routes->GET('template/variables/(:num)', 'Api\Certificate::getVariables/$1');
+    $routes->POST('page', 'Api\Certificate::page');
+    $routes->POST('page/(:num)', 'Api\Certificate::page/$1');
     $routes->POST('template/upload/data', 'Api\Certificate::templateUploadData');
     $routes->POST('generate', 'Api\Certificate::generate');
+    $routes->GET('generated/(:num)', 'Api\Certificate::generatedList/$1');
     $routes->GET('download/all/(:num)', 'Api\Certificate::downloadAllCertificates/$1');
     $routes->GET('download/zip/(:num)', 'Api\Certificate::downloadAllCertificates/$1');
 
@@ -86,7 +89,6 @@ $routes->post('admin/certificates/(:num)/delete', 'AdminDashboard::deleteCertifi
 $routes->post('admin/certificates/(:num)/batches/(:any)/delete', 'AdminDashboard::deleteBatch/$1/$2');
 $routes->get('admin/certificates/(:num)/download-pdf', 'AdminDashboard::downloadLatestPDF/$1');
 
-$routes->post('api/cron/certificates/zip', 'Api\CronController::processCertificateZip');
 
 
 

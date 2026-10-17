@@ -51,19 +51,8 @@
             <?php if (!empty($combined_pdf_url)): ?>
                 <a href="<?= $combined_pdf_url ?>" target="_blank" class="btn btn-primary"
                     style="background: linear-gradient(135deg, #FF512F 0%, #DD2476 100%); border: none;">
-                    <i class="fas fa-file-pdf"></i> Download Single PDF
+                    <i class="fas fa-file-pdf"></i> Download All (one PDF)
                 </a>
-            <?php endif; ?>
-
-            <?php if (!empty($zip_job_id)): ?>
-                <div style="display: flex; flex-direction: column; gap: 5px;">
-                    <a href="<?= base_url('admin/certificates/' . $certificate['id'] . '/view') ?>" class="btn"
-                        style="background: rgba(16, 185, 129, 0.1); border: 1px solid var(--accent); color: var(--accent);">
-                        <i class="fas fa-file-archive"></i> ZIP Job Queued (#<?= $zip_job_id ?>)
-                    </a>
-                    <span style="font-size: 0.7rem; color: var(--text-dim); text-align: center;">ZIP will be ready in 1-2
-                        minutes.</span>
-                </div>
             <?php endif; ?>
         </div>
     </div>
