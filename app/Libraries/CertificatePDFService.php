@@ -31,9 +31,35 @@ class CertificatePDFService
     /** Prepared templates already looked up in this request. */
     private array $prepared = [];
 
+    /** Uploaded photos downloaded once per batch. */
+    private array $photos = [];
+
     public function __construct(?TemplateImageCache $templates = null)
     {
         $this->templates = $templates ?? new TemplateImageCache();
+    }
+
+    public function __destruct()
+    {
+        foreach ($this->photos as $photo) {
+            if (is_file($photo['path'])) {
+                unlink($photo['path']);
+            }
+        }
+    }
+
+    private function hasValidS3Signature(string $query): bool
+    {
+        parse_str($query, $parameters);
+
+        return isset(
+            $parameters['X-Amz-Algorithm'],
+            $parameters['X-Amz-Credential'],
+            $parameters['X-Amz-Date'],
+            $parameters['X-Amz-Expires'],
+            $parameters['X-Amz-SignedHeaders'],
+            $parameters['X-Amz-Signature']
+        ) && (int) $parameters['X-Amz-Expires'] === 86400;
     }
 
     /**
@@ -70,9 +96,6 @@ class CertificatePDFService
 
         $this->renderTemplate($pdf, $certificate, $templateVars, $data);
 
-        // Final metadata
-        $this->addMetadata($pdf, $data);
-
         return $pdf->Output('', 'S');
     }
 
@@ -93,7 +116,6 @@ class CertificatePDFService
                 $pdf->AddPage();
             }
             $this->renderTemplate($pdf, $certificate, $templateVars, $data);
-            $this->addMetadata($pdf, $data);
         }
 
         return $pdf->Output('', 'S');
@@ -172,6 +194,7 @@ class CertificatePDFService
             'Helvetica' => 'helvetica',
             'Times' => 'times',
             'Times New Roman' => 'times',
+            'Georgia' => 'times',
             'Courier' => 'courier',
             'Courier New' => 'courier'
         ];
@@ -179,12 +202,36 @@ class CertificatePDFService
         // Add variables
         foreach ($templateVars as $var) {
             $varKey = $var['var_key'];
-            $value = $data[$varKey] ?? $var['label'] ?? '';
-            if (empty($value))
+            $options = $this->optionsOf($var);
+            $kind = strtolower((string) ($options['kind'] ?? 'text'));
+            $isCode = $kind === 'qrcode' || $kind === 'barcode';
+            $valueKey = $isCode
+                ? (string) ($options['source_key'] ?? $varKey)
+                : $varKey;
+            $value = $isCode && ($options['payload_mode'] ?? 'field') === 'custom'
+                ? ($options['payload'] ?? '')
+                : ($data[$valueKey] ?? ($kind === 'image' ? '' : ($var['label'] ?? '')));
+
+            if ($value === null || $value === '' || $value === [])
                 continue;
+
+            // Image answers are structured S3 references, not text values.
+            // Their positions and bounds use the same artwork-relative units.
+            $x = (float) ($var['x'] ?? 0) * $this->pixelsToMm;
+            $y = (float) ($var['y'] ?? 0) * $this->pixelsToMm;
+
+            if ($kind === 'image') {
+                $this->placeImage($pdf, $value, $x, $y, $options);
+
+                continue;
+            }
 
             // Date formatting
             if (strpos(strtolower($varKey), 'date') !== false) {
+                if (!is_scalar($value)) {
+                    continue;
+                }
+
                 try {
                     $date = new \DateTime($value);
                     $value = $date->format('F j, Y');
@@ -192,22 +239,47 @@ class CertificatePDFService
                 }
             }
 
-            // CRITICAL: Convert pixels to mm
-            $x = (float) ($var['x'] ?? 0) * $this->pixelsToMm;
-            $y = (float) ($var['y'] ?? 0) * $this->pixelsToMm;
-
             // A field can be printed as a code rather than as its characters.
             // An ID card usually carries at least one — a QR square to scan at
             // a gate, a barcode to swipe — and what is encoded is the field's
             // own value, so nothing new has to be collected to produce one.
-            $options = $this->optionsOf($var);
-            $kind    = strtolower((string) ($options['kind'] ?? 'text'));
-
             $fontSize = (float) ($var['font_size'] ?? 12);
             $color = $var['color'] ?? '#000000';
             $fontFamily = $var['font_family'] ?? 'Arial';
             $tcpdfFont = $fontMap[$fontFamily] ?? 'helvetica';
-            $align = strtoupper($var['align'] ?? 'L');
+            $align = match (strtolower((string) ($var['align'] ?? 'left'))) {
+                'center', 'c' => 'C',
+                'right', 'r' => 'R',
+                default => 'L',
+            };
+
+            if ($isCode) {
+                if (is_array($value)) {
+                    $value = $value['value'] ?? '';
+                }
+
+                if (!is_scalar($value)) {
+                    continue;
+                }
+                $value = trim((string) $value);
+
+                if ($value === '') {
+                    continue;
+                }
+
+                if (strlen($value) > 2000) {
+                    throw new \RuntimeException(sprintf(
+                        'Code value for "%s" exceeds the 2,000-character limit.',
+                        (string) ($var['label'] ?? $varKey)
+                    ));
+                }
+            } elseif (is_array($value)) {
+                $value = $value['name'] ?? '';
+            }
+
+            if (!is_scalar($value)) {
+                continue;
+            }
 
             // Hex to RGB
             $hex = str_replace('#', '', $color);
@@ -221,7 +293,7 @@ class CertificatePDFService
                 $b = hexdec(substr($hex, 4, 2));
             }
 
-            if ($kind === 'qrcode' || $kind === 'barcode') {
+            if ($isCode) {
                 $this->placeCode($pdf, $kind, (string) $value, $x, $y, $options, $r, $g, $b);
 
                 continue;
@@ -335,6 +407,185 @@ class CertificatePDFService
     }
 
     /**
+     * Draws an uploaded form photo, preserving its aspect ratio inside the
+     * artwork-relative box centred on the editor's placement point.
+     */
+    private function placeImage(TCPDF $pdf, mixed $value, float $x, float $y, array $options): void
+    {
+        if (!is_array($value) || ($value['_type'] ?? null) !== 'image') {
+            throw new \RuntimeException('The selected photo field has no usable image.');
+        }
+
+        $url = (string) ($value['url'] ?? '');
+        $parsedUrl = parse_url($url);
+        $host = is_array($parsedUrl) ? (string) ($parsedUrl['host'] ?? '') : '';
+
+        if (!is_array($parsedUrl)
+            || ($parsedUrl['scheme'] ?? null) !== 'https'
+            || !preg_match('/^[a-z0-9][a-z0-9.-]*\.s3(?:\.[a-z0-9-]+)?\.amazonaws\.com$/i', $host)
+            || isset($parsedUrl['user'])
+            || isset($parsedUrl['pass'])
+            || isset($parsedUrl['port'])
+            || isset($parsedUrl['fragment'])
+            || !preg_match('#^/forms/uploads/\d+/[A-Za-z0-9._%-]+$#D', (string) ($parsedUrl['path'] ?? ''))
+            || !$this->hasValidS3Signature($parsedUrl['query'] ?? '')) {
+            throw new \RuntimeException('The selected photo does not have a valid 24-hour private S3 URL. Resend recipient data from RegX.');
+        }
+
+        $fit = strtolower((string) ($options['fit'] ?? 'contain'));
+        $fit = $fit === 'cover' ? 'cover' : 'contain';
+        $cacheKey = $url . '|' . $fit;
+
+        if (!isset($this->photos[$cacheKey])) {
+            $directory = WRITEPATH . 'tmp/certificate-photos';
+
+            if (!is_dir($directory) && !mkdir($directory, 0755, true) && !is_dir($directory)) {
+                throw new \RuntimeException('Could not prepare temporary photo storage.');
+            }
+
+            $path = tempnam($directory, 'photo_');
+
+            if ($path === false) {
+                throw new \RuntimeException('Could not create temporary photo storage.');
+            }
+            try {
+                $this->downloadPublicPhoto($url, $path);
+
+                if (!is_file($path) || filesize($path) > 10 * 1024 * 1024) {
+                    throw new \RuntimeException('The selected photo is missing or exceeds the 10 MB limit.');
+                }
+
+                $image = getimagesize($path);
+                $imageTypes = [
+                    IMAGETYPE_JPEG => 'JPG',
+                    IMAGETYPE_PNG  => 'PNG',
+                    IMAGETYPE_GIF  => 'GIF',
+                ];
+
+                if ($image === false || !isset($imageTypes[$image[2]])
+                    || $image[0] > 8000 || $image[1] > 8000 || $image[0] * $image[1] > 40000000) {
+                    throw new \RuntimeException('The selected photo must be a valid JPEG, PNG, or GIF image.');
+                }
+
+                if ($fit === 'cover') {
+                    $cropPath = $this->cropPhotoToBox(
+                        $path,
+                        $directory,
+                        $image[0],
+                        $image[1],
+                        max(1.0, (float) ($options['w'] ?? 96)),
+                        max(1.0, (float) ($options['h'] ?? 128))
+                    );
+                    unlink($path);
+                    $path = $cropPath;
+                    $image = getimagesize($path);
+                    $imageTypes[$image[2]] = 'PNG';
+                }
+
+                $this->photos[$cacheKey] = [
+                    'path'   => $path,
+                    'type'   => $fit === 'cover' ? 'PNG' : $imageTypes[$image[2]],
+                    'width'  => $image[0],
+                    'height' => $image[1],
+                ];
+            } catch (\Throwable $error) {
+                if (is_file($path)) {
+                    unlink($path);
+                }
+
+                throw $error;
+            }
+        }
+
+        $photo = $this->photos[$cacheKey];
+        $boxWidth = max(1.0, (float) ($options['w'] ?? 96) * $this->pixelsToMm);
+        $boxHeight = max(1.0, (float) ($options['h'] ?? 128) * $this->pixelsToMm);
+        $scale = $fit === 'cover'
+            ? max($boxWidth / $photo['width'], $boxHeight / $photo['height'])
+            : min($boxWidth / $photo['width'], $boxHeight / $photo['height']);
+        $width = $photo['width'] * $scale;
+        $height = $photo['height'] * $scale;
+
+        $pdf->Image(
+            $photo['path'],
+            $x - ($width / 2),
+            $y - ($height / 2),
+            $width,
+            $height,
+            $photo['type']
+        );
+    }
+
+    private function cropPhotoToBox(
+        string $path,
+        string $directory,
+        int $sourceWidth,
+        int $sourceHeight,
+        float $boxWidth,
+        float $boxHeight
+    ): string {
+        if (!function_exists('imagecreatefromstring')) {
+            throw new \RuntimeException('GD is required to crop a photo to its placement box.');
+        }
+
+        $sourceBytes = file_get_contents($path);
+        $source = $sourceBytes === false ? false : imagecreatefromstring($sourceBytes);
+
+        if ($source === false) {
+            throw new \RuntimeException('Could not prepare the selected photo for cropping.');
+        }
+
+        $targetRatio = $boxWidth / $boxHeight;
+        $sourceRatio = $sourceWidth / $sourceHeight;
+
+        if ($sourceRatio > $targetRatio) {
+            $cropHeight = $sourceHeight;
+            $cropWidth = (int) round($sourceHeight * $targetRatio);
+            $sourceX = (int) floor(($sourceWidth - $cropWidth) / 2);
+            $sourceY = 0;
+        } else {
+            $cropWidth = $sourceWidth;
+            $cropHeight = (int) round($sourceWidth / $targetRatio);
+            $sourceX = 0;
+            $sourceY = (int) floor(($sourceHeight - $cropHeight) / 2);
+        }
+
+        $cropped = imagecreatetruecolor($cropWidth, $cropHeight);
+        imagealphablending($cropped, false);
+        imagesavealpha($cropped, true);
+        imagecopyresampled(
+            $cropped,
+            $source,
+            0,
+            0,
+            $sourceX,
+            $sourceY,
+            $cropWidth,
+            $cropHeight,
+            $cropWidth,
+            $cropHeight
+        );
+
+        $cropPath = tempnam($directory, 'crop_');
+
+        if ($cropPath === false || !imagepng($cropped, $cropPath)) {
+            imagedestroy($source);
+            imagedestroy($cropped);
+
+            if ($cropPath !== false && is_file($cropPath)) {
+                unlink($cropPath);
+            }
+
+            throw new \RuntimeException('Could not crop the selected photo.');
+        }
+
+        imagedestroy($source);
+        imagedestroy($cropped);
+
+        return $cropPath;
+    }
+
+    /**
      * Draws a line of text centred on the point it was placed at.
      *
      * The marker in the layout editor sits on its own centre — you drag a
@@ -378,29 +629,73 @@ class CertificatePDFService
 
         // ignore_min_height keeps the height at nothing, and centring within
         // nothing puts the middle of the em box on the point.
-        $pdf->Cell($width, 0, $value, 0, 0, 'L', false, '', 0, true, 'T', 'M');
+        $pdf->Cell($width, 0, $value, 0, 0, 'L', false, '', 0, true, 'T', 'M'        );
     }
 
-    /**
-     * Add fixed metadata like Cert No and Issue Date at bottom
-     */
-    private function addMetadata(&$pdf, $data)
+    private function downloadPublicPhoto(string $url, string $path): void
     {
-        $pageWidth = $pdf->getPageWidth();
-        $pageHeight = $pdf->getPageHeight();
-        $pdf->SetFont('helvetica', '', 8);
-        $pdf->SetTextColor(100, 100, 100);
+        $handle = fopen($path, 'wb');
 
-        if (!empty($data['certificate_number'])) {
-            $pdf->SetXY(10, $pageHeight - 15);
-            $pdf->Cell(0, 0, 'Certificate No: ' . $data['certificate_number'], 0, 0, 'L');
+        if ($handle === false) {
+            throw new \RuntimeException('Could not open temporary photo storage.');
         }
 
-        if (!empty($data['issue_date'])) {
-            $text = 'Issued: ' . $data['issue_date'];
-            $textWidth = $pdf->GetStringWidth($text);
-            $pdf->SetXY($pageWidth - 10 - $textWidth, $pageHeight - 10);
-            $pdf->Cell(0, 0, $text, 0, 0, 'L');
+        $size = 0;
+        $tooLarge = false;
+        $curl = curl_init($url);
+
+        if ($curl === false) {
+            fclose($handle);
+            throw new \RuntimeException('Could not initialize the photo download.');
+        }
+
+        try {
+            curl_setopt_array($curl, [
+                CURLOPT_FOLLOWLOCATION => false,
+                CURLOPT_CONNECTTIMEOUT => 10,
+                CURLOPT_TIMEOUT => 30,
+                CURLOPT_SSL_VERIFYPEER => true,
+                CURLOPT_SSL_VERIFYHOST => 2,
+                CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+                CURLOPT_WRITEFUNCTION => static function ($curl, string $chunk) use ($handle, &$size, &$tooLarge): int {
+                    $size += strlen($chunk);
+
+                    if ($size > 10 * 1024 * 1024) {
+                        $tooLarge = true;
+                        return 0;
+                    }
+
+                    $written = fwrite($handle, $chunk);
+                    return $written === false ? 0 : $written;
+                },
+            ]);
+
+            $downloaded = curl_exec($curl);
+            $statusCode = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+
+            if ($tooLarge) {
+                throw new \RuntimeException('The selected photo exceeds the 10 MB limit.');
+            }
+
+            if ($downloaded === false || $statusCode < 200 || $statusCode >= 300) {
+                if ($statusCode === 403) {
+                    throw new \RuntimeException(
+                        'S3 denied access to the certificate photo. The private photo link may have expired; resend recipient data from RegX and generate within 24 hours.'
+                    );
+                }
+
+                if ($statusCode === 404) {
+                    throw new \RuntimeException('The uploaded form photo was not found in S3. Re-upload it in the form and resend recipient data.');
+                }
+
+                throw new \RuntimeException(sprintf(
+                    'Could not fetch the selected photo from its public S3 URL (HTTP %d).',
+                    $statusCode
+                ));
+            }
+        } finally {
+            curl_close($curl);
+            fclose($handle);
         }
     }
 }

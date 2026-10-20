@@ -1441,11 +1441,27 @@ class Certificate extends Controller
                 $sourceDataIds[] = $d['id'];
             }
         } elseif (!empty($data['data_ids']) && is_array($data['data_ids'])) {
-            foreach ($data['data_ids'] as $id) {
-                $d = $this->dataModel->find((int) $id);
-                if ($d && $d['certificate_id'] == $certificateId) {
-                    $rows[] = json_decode($d['data'], true);
-                    $sourceDataIds[] = $d['id'];
+            $requestedIds = array_values(array_unique(array_filter(
+                array_map('intval', $data['data_ids']),
+                static fn (int $id): bool => $id > 0
+            )));
+
+            if ($requestedIds !== []) {
+                $records = $this->dataModel
+                    ->where('certificate_id', $certificateId)
+                    ->whereIn('id', $requestedIds)
+                    ->findAll();
+                $recordsById = array_column($records, null, 'id');
+
+                // Keep the caller's order and duplicate IDs while loading the
+                // selected records in one query instead of one query per row.
+                foreach ($data['data_ids'] as $id) {
+                    $record = $recordsById[(int) $id] ?? null;
+
+                    if ($record !== null) {
+                        $rows[] = json_decode($record['data'], true);
+                        $sourceDataIds[] = $record['id'];
+                    }
                 }
             }
         } else {
